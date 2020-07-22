@@ -1,0 +1,17 @@
+<?php
+
+/**
+ * @file
+ * Uninstall function for the wooppay module.
+ */
+
+/**
+ * Implements hook_uninstall().
+ */
+function wooppay_uninstall() {
+  variable_del('wooppay_url');
+  variable_del('wooppay_username');
+  variable_del('wooppay_password');
+  variable_del('wooppay_prefix');
+  variable_del('wooppay_service');
+}

@@ -1,0 +1,601 @@
+<?php
+
+define('WOOPPAY_IP_LIST', serialize(array('85.29.137.52', '54.246.137.198')));
+
+/**
+ * Implements hook_permission().
+ */
+function wooppay_permission()
+{
+	return array(
+		'administer wooppay' => array(
+			'title' => 'Administer Wooppay',
+			'description' => 'Access the Wooppay settings page',
+		),
+	);
+}
+
+/**
+ * Implements hook_menu().
+ */
+function wooppay_menu()
+{
+
+	$items['admin/commerce/config/wooppay'] = array(
+		'title' => 'WOOPPAY configuration',
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('wooppay_config'),
+		'access arguments' => array('administer wooppay'),
+		'type' => MENU_NORMAL_ITEM,
+	);
+	$items['commerce/wooppay/response'] = array(
+		'page callback' => 'wooppay_response',
+		'access callback' => TRUE,
+		'access arguments' => array('access content'),
+		'type' => MENU_CALLBACK,
+	);
+
+	return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function wooppay_commerce_payment_method_info()
+{
+	$payment_methods = array();
+
+	$payment_methods['wooppay'] = array(
+		'title' => 'Wooppay',
+		'description' => 'Payment via Wooppay payment system',
+		'terminal' => FALSE,
+		'offsite' => TRUE,
+		'active' => TRUE,
+		'offsite_autoredirect' => TRUE,
+	);
+
+	return $payment_methods;
+}
+
+/**
+ * Payment method settings form.
+ */
+function wooppay_config()
+{
+	$form['wooppay_url'] = array(
+		'#type' => 'textfield',
+		'#title' => 'API URL',
+		'#default_value' => variable_get('wooppay_url', ''),
+		'#description' => "URL received from your Wooppay Technical Consultant",
+		'#required' => TRUE,
+	);
+
+	$form['wooppay_username'] = array(
+		'#type' => 'textfield',
+		'#title' => 'API Username',
+		'#default_value' => variable_get('wooppay_username', ''),
+		'#description' => "Username received from your Wooppay Technical Consultant",
+		'#required' => TRUE,
+	);
+
+	$form['wooppay_password'] = array(
+		'#type' => 'textfield',
+		'#title' => 'API Password',
+		'#default_value' => variable_get('wooppay_password', ''),
+		'#description' => "Password received from your Wooppay Technical Consultant",
+		'#required' => TRUE,
+	);
+
+	$form['wooppay_prefix'] = array(
+		'#type' => 'textfield',
+		'#title' => 'Order Prefix',
+		'#default_value' => variable_get('wooppay_prefix', ''),
+		'#description' => "Prefix for your invoices",
+		'#required' => TRUE,
+	);
+
+	$form['wooppay_service'] = array(
+		'#type' => 'textfield',
+		'#title' => 'Service Name',
+		'#default_value' => variable_get('wooppay_service', ''),
+		'#description' => "Your current service name",
+		'#required' => TRUE,
+	);
+
+	return system_settings_form($form);
+}
+
+/**
+ * Payment method callback: submit form.
+ */
+function wooppay_submit_form($payment_method, $pane_values, $checkout_pane, $order)
+{
+	$form = array();
+
+	$text = theme('image', array('path' => drupal_get_path('module', 'wooppay') . '/images/logo.png', 'alt' => 'Wooppay Visa/Mastercard'));
+	$text .= '<div >' . 'Pay via Wooppay' . '</div>';
+	$form['info'] = array('#markup' => $text);
+
+	return $form;
+}
+
+/*
+ * Payment method callback
+ */
+function wooppay_redirect_form($form, &$form_state, $order, $payment_method)
+{
+	try {
+		$client = new WooppaySoapClient(variable_get('wooppay_url', ''));
+		if ($client->login(variable_get('wooppay_username', ''), variable_get('wooppay_password', ''))) {
+			$requestUrl = url('commerce/wooppay/response', array('absolute' => TRUE)).'?id='.$order->order_id;
+			$backUrl = url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE));
+			$orderPrefix = variable_get('wooppay_prefix', '');
+			$serviceName = variable_get('wooppay_service', '');
+			$amount = round(commerce_currency_amount_to_decimal($order->commerce_order_total[LANGUAGE_NONE][0]['amount'], commerce_default_currency()));
+			$invoice = $client->createInvoice($orderPrefix . '_' . $order->order_id, $backUrl, $requestUrl, $amount, $serviceName, 'Оплата заказа №' . $order->order_id, '', '', $order->mail, '');
+		}
+	} catch (BadCredentialsException $e) {
+		watchdog("wooppay", "Bad credentials exception: %e", array('%e' => $e), WATCHDOG_WARNING);
+	} catch (UnsuccessfulResponseException $e) {
+		watchdog("wooppay", "Unsuccessful response exception: %e", array('%e' => $e), WATCHDOG_WARNING);
+	} catch (WooppaySoapException $e) {
+		watchdog("wooppay", "Soap exception: %e", array('%e' => $e), WATCHDOG_WARNING);
+	}
+	drupal_goto($invoice->response->operationUrl);
+}
+
+/**
+ * Callback for WOOPPAY system response.
+ */
+function wooppay_response()
+{
+	/* Check for allowed IP */
+
+	$allowed_ip = unserialize(WOOPPAY_IP_LIST);
+	if (!in_array($_SERVER['REMOTE_ADDR'], $allowed_ip)) {
+		watchdog("wooppay", "Possible fraud. Request from disallowed IP address: %ip", array('%ip' => ip_address()), WATCHDOG_WARNING);
+		exit();
+	}
+
+	/* Approve the order */
+	if ($_GET) {
+		if (!empty($_GET['id'])) {
+			// store data to log
+			$log = var_export($_GET, TRUE);
+			watchdog('wooppay', "Payment status: {approved} <pre>%log</pre>", array('%log' => $log));
+			$order = commerce_order_load($_GET['id']);
+			$transaction = commerce_payment_transaction_new('wooppay', $order->order_id);
+			$transaction->instance_id = $order->data['payment_method'];
+			$transaction->amount = $order->commerce_order_total[LANGUAGE_NONE][0]['amount'];
+			$transaction->currency_code = $order->commerce_order_total[LANGUAGE_NONE][0]['currency_code'];
+			$transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+			$transaction->message = 'Wooppay invoice was paid';
+			commerce_payment_transaction_save($transaction);
+			commerce_order_status_update($order, 'processing', $skip_save = FALSE, $revision = NULL, $log = 'change status');
+			die('{"data":1}');
+		}
+	}
+}
+
+class WooppaySoapClient
+{
+	private $c;
+
+	public function __construct($url, $options = array())
+	{
+		try {
+			$this->c = new SoapClient($url, $options);
+		} catch (Exception $e) {
+			throw new WooppaySoapException($e->getMessage());
+		}
+		if (empty($this->c)) {
+			throw new WooppaySoapException('Cannot create instance of Soap client');
+		}
+	}
+
+	/**
+	 * @param $method
+	 * @param $data
+	 * @return WooppaySoapResponse
+	 * @throws BadCredentialsException
+	 * @throws UnsuccessfulResponseException
+	 * @throws WooppaySoapException
+	 */
+	public function __call($method, $data)
+	{
+		try {
+
+			$response = $this->c->$method($data[0]);
+		} catch (Exception $e) {
+			throw new WooppaySoapException($e->getMessage());
+		}
+		$response = new WooppaySoapResponse($response);
+		switch ($response->error_code) {
+			case 0:
+				return $response;
+				break;
+			case 5:
+				throw new BadCredentialsException();
+				break;
+			default:
+				throw new UnsuccessfulResponseException('Error code ' . $response->error_code, $response->error_code);
+		}
+
+	}
+
+	/**
+	 * @param string $login
+	 * @param string $pass
+	 * @return boolean
+	 * @throws BadCredentialsException
+	 * @throws UnsuccessfulResponseException
+	 * @throws WooppaySoapException
+	 */
+	public function login($login, $pass)
+	{
+		$login_request = new CoreLoginRequest();
+		$login_request->username = $login;
+		$login_request->password = $pass;
+		$response = $this->core_login($login_request);
+
+		if (isset($response->response->session)) {
+			$this->c->__setCookie('session', $response->response->session);
+			return true;
+		} else {
+			return false;
+		}
+	}
+
+	/**
+	 * @param int $operationId
+	 * @return CashGetOperationDataResponse
+	 * @throws UnsuccessfulResponseException
+	 * @throws WooppaySoapException
+	 */
+	public function getOperationData($operationId)
+	{
+		$data = new CashGetOperationDataRequest();
+		$data->operationId = array($operationId);
+		return $this->cash_getOperationData($data);
+	}
+
+	/**
+	 * @param string $referenceId
+	 * @param string $backUrl
+	 * @param string $requestUrl
+	 * @param float $amount
+	 * @param string $addInfo
+	 * @param string $deathDate
+	 * @param string $description
+	 * @param string $userEmail
+	 * @param string $userPhone
+	 * @return CashCreateInvoiceResponse
+	 * @throws UnsuccessfulResponseException
+	 * @throws WooppaySoapException
+	 */
+	public function createInvoice($referenceId, $backUrl, $requestUrl, $amount, $serviceName = '', $addInfo = '', $deathDate = '', $description = '', $userEmail = '', $userPhone = '')
+	{
+		$data = new CashCreateInvoiceByServiceRequest();
+		$data->referenceId = $referenceId;
+		$data->backUrl = $backUrl;
+		$data->requestUrl = $requestUrl;
+		$data->amount = (float)$amount;
+		$data->addInfo = $addInfo;
+		$data->deathDate = $deathDate;
+		$data->description = $description;
+		$data->userEmail = $userEmail;
+		$data->userPhone = $userPhone;
+		$data->serviceName = $serviceName;
+		return $this->cash_createInvoiceByService($data);
+	}
+
+	public function getLastDialog()
+	{
+		return array('req' => $this->c->__getLastRequest(), 'res' => $this->c->__getLastResponse());
+	}
+}
+
+class CoreLoginRequest
+{
+	/**
+	 * @var string $username
+	 * @soap
+	 */
+	public $username;
+	/**
+	 * @var string $password
+	 * @soap
+	 */
+	public $password;
+	/**
+	 * @var string $captcha
+	 * @soap
+	 */
+	public $captcha = null;
+}
+
+class CashGetOperationDataRequest
+{
+	/**
+	 * @var $operationId array
+	 */
+	public $operationId;
+
+}
+
+class CashCreateInvoiceRequest
+{
+	/**
+	 * @var string $referenceId
+	 * @soap
+	 */
+	public $referenceId;
+	/**
+	 * @var string $backUrl
+	 * @soap
+	 */
+	public $backUrl;
+	/**
+	 * @var string $requestUrl
+	 * @soap
+	 */
+	public $requestUrl = '';
+	/**
+	 * @var string $addInfo
+	 * @soap
+	 */
+	public $addInfo;
+	/**
+	 * @var float $amount
+	 * @soap
+	 */
+	public $amount;
+	/**
+	 * @var string $deathDate
+	 * @soap
+	 */
+	public $deathDate;
+	/**
+	 * @var int $serviceType
+	 * @soap
+	 */
+	public $serviceType = 4;
+	/**
+	 * @var string $description
+	 * @soap
+	 */
+	public $description = '';
+	/**
+	 * @var int $orderNumber
+	 * @soap
+	 */
+	public $orderNumber = null;
+	/**
+	 * @var string $userEmail
+	 * @soap
+	 */
+	public $userEmail = null;
+	/**
+	 * @var string $userPhone
+	 * @soap
+	 */
+	public $userPhone = null;
+}
+
+class CashCreateInvoiceExtendedRequest extends CashCreateInvoiceRequest
+{
+	/**
+	 * @var string $userEmail
+	 * @soap
+	 */
+	public $userEmail = '';
+	/**
+	 * @var string $userPhone
+	 * @soap
+	 */
+	public $userPhone = '';
+}
+
+class CashCreateInvoiceExtended2Request extends CashCreateInvoiceExtendedRequest
+{
+	/**
+	 * @var int $cardForbidden
+	 * @soap
+	 */
+	public $cardForbidden;
+}
+
+class CashCreateInvoiceByServiceRequest extends CashCreateInvoiceExtended2Request {
+	/**
+	 * @var string $serviceName
+	 * @soap
+	 */
+	public $serviceName;
+}
+
+class WooppaySoapResponse
+{
+
+	public $error_code;
+	public $response;
+
+	public function __construct($response)
+	{
+
+		if (!is_object($response)) {
+			throw new BadResponseException('Response is not an object');
+		}
+
+		if (!isset($response->error_code)) {
+			throw new BadResponseException('Response do not contains error code');
+		}
+		$this->error_code = $response->error_code;
+
+		if (!property_exists($response, 'response')) {
+			throw new BadResponseException('Response do not contains response body');
+		}
+		$this->response = $response->response;
+	}
+}
+
+class BaseResponse
+{
+	/**
+	 * @var int $error_code
+	 * @soap
+	 */
+	public $error_code;
+}
+
+class CashCreateInvoiceResponse extends BaseResponse
+{
+	/**
+	 * @var CashCreateInvoiceResponseData $response
+	 * @soap
+	 */
+	public $response;
+}
+
+class CashCreateInvoiceResponseData
+{
+	/**
+	 * @var int $operationId
+	 * @soap
+	 */
+	public $operationId;
+	/**
+	 * @var string $operationUrl
+	 * @soap
+	 */
+	public $operationUrl;
+}
+
+class CashGetOperationDataResponse extends BaseResponse
+{
+	/**
+	 * @var CashGetOperationDataResponseData $response
+	 * @soap
+	 */
+	public $response;
+}
+
+class CashGetOperationDataResponseData
+{
+	/**
+	 * @var CashGetOperationDataResponseDataRecord[] $records
+	 * @soap
+	 */
+	public $records;
+}
+
+class CashGetOperationDataResponseDataRecord
+{
+	/**
+	 * @var int $id
+	 * @soap
+	 */
+	public $id;
+	/**
+	 * @var int $type
+	 * @soap
+	 */
+	public $type;
+	/**
+	 * @var int $lotId
+	 * @soap
+	 */
+	public $lotId;
+	/**
+	 * @var float $sum
+	 * @soap
+	 */
+	public $sum;
+	/**
+	 * @var string $date
+	 * @soap
+	 */
+	public $date;
+	/**
+	 * @var int $status
+	 * @soap
+	 */
+	public $status;
+	/**
+	 * @var string $comment
+	 * @soap
+	 */
+	public $comment;
+	/**
+	 * @var string $fromSubject
+	 * @soap
+	 */
+	public $fromSubject;
+	/**
+	 * @var string $toSubject
+	 * @soap
+	 */
+	public $toSubject;
+	/**
+	 * @var string $fromFullName
+	 * @soap
+	 */
+	public $fromFullName;
+	/**
+	 * @var string $toFullName
+	 * @soap
+	 */
+	public $toFullName;
+}
+
+class WooppayOperationStatus
+{
+	/**
+	 * Новая
+	 */
+	const OPERATION_STATUS_NEW = 1;
+	/**
+	 * На рассмотрении
+	 */
+	const OPERATION_STATUS_CONSIDER = 2;
+	/**
+	 * Отклонена
+	 */
+	const OPERATION_STATUS_REJECTED = 3;
+	/**
+	 * Проведена
+	 */
+	const OPERATION_STATUS_DONE = 4;
+	/**
+	 * Сторнирована
+	 */
+	const OPERATION_STATUS_CANCELED = 5;
+	/**
+	 * Сторнирующая
+	 */
+	const OPERATION_STATUS_CANCELING = 6;
+	/**
+	 * Удалена
+	 */
+	const OPERATION_STATUS_DELETED = 7;
+	/**
+	 * На квитовании
+	 */
+	const OPERATION_STATUS_KVITOVANIE = 4;
+	/**
+	 * На ожидании подверждения или отказа мерчанта
+	 */
+	const OPERATION_STATUS_WAITING = 9;
+}
+
+class WooppaySoapException extends Exception
+{
+}
+class BadResponseException extends WooppaySoapException
+{
+}
+class UnsuccessfulResponseException extends WooppaySoapException
+{
+}
+class BadCredentialsException extends UnsuccessfulResponseException
+{
+}
