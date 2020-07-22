@@ -1,5 +1,5 @@
 # drupal_payment_gateway_v7.x
-Woopkassa payment gateway for OpenCart CMS as a module. Supported version 2.*
+Woopkassa payment gateway for Drupal CMS as a module. Supported version 7.*
 ## Установка
 * Кликнуть на зеленую кнопку "Code"
 * В появившемся окне выбрать "Download ZIP"
